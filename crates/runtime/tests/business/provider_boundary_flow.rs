@@ -14,7 +14,6 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::TcpListener as TokioTcpListener;
 use tura_llm_rust::{
@@ -24,8 +23,6 @@ use tura_llm_rust::{
 
 #[path = "../support/session_db_support.rs"]
 mod session_db_support;
-#[path = "../support/typed_session.rs"]
-mod typed_session;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 static ASYNC_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -534,33 +531,9 @@ async fn runtime_http_auth_failure_is_not_retryable() {
 }
 
 #[tokio::test]
-async fn runtime_prompt_cache_key_reuses_root_session_for_forked_sessions() {
+async fn runtime_does_not_author_prompt_cache_key() {
     let _guard = ASYNC_ENV_LOCK.lock().await;
-    let _session_db = session_db_support::SessionDbTestService::start(&ENV_LOCK);
     let workspace = tempfile::tempdir().expect("runtime cache workspace");
-    let workspace_text = workspace.path().to_string_lossy().to_string();
-    let root_session_id = "cache-root-session";
-    let child_session_id = "cache-child-session";
-    let client = runtime::session_log_client::SessionLogClient::discover()
-        .expect("session db client should be available");
-    typed_session::create_via_service(typed_session::root_create_request(
-        root_session_id,
-        &workspace_text,
-        root_session_id,
-        1,
-    ))
-    .expect("root session should persist");
-    typed_session::create_via_service(typed_session::create_request(
-        child_session_id,
-        &workspace_text,
-        child_session_id,
-        1,
-        lifecycle::SessionCommand::ForkSession {
-            parent_id: root_session_id.to_string(),
-        },
-    ))
-    .expect("child session should persist");
-    wait_for_session_parent(&client, child_session_id, root_session_id);
 
     let provider = LocalProvider::start(vec![ProviderReply::Json {
         status: "200 OK",
@@ -586,7 +559,7 @@ async fn runtime_prompt_cache_key_reuses_root_session_for_forked_sessions() {
     );
     let runtime = runtime_for_provider(
         "runtime-cache-root",
-        child_session_id,
+        "cache-session",
         "openai-cache-route",
         "openai",
         "gpt-cache-local",
@@ -613,16 +586,11 @@ async fn runtime_prompt_cache_key_reuses_root_session_for_forked_sessions() {
     .expect("runtime cache call should succeed");
 
     let requests = provider.requests();
-    let cache_key = requests[0].body["prompt_cache_key"]
-        .as_str()
-        .expect("prompt cache key should be sent for OpenAI providers");
-    assert!(
-        cache_key.starts_with("turaosv2:openai-cache-route:cache-root-session:"),
-        "forked sessions should reuse the root session cache key, got {cache_key}"
-    );
+    let cache_key = requests[0].body["prompt_cache_key"].as_str();
+    assert!(cache_key.is_none(), "Tura must not author prompt cache keys");
     assert_eq!(
         result.input.expect("runtime input")["options"]["prompt_cache_key"],
-        cache_key
+        Value::Null
     );
 }
 
@@ -865,35 +833,6 @@ fn settings_for_route(
         model_catalog: ModelCatalog::default(),
         provider_enums: ProviderEnumCatalog::default(),
     }
-}
-
-fn wait_for_session_parent(
-    client: &runtime::session_log_client::SessionLogClient,
-    session_id: &str,
-    parent_id: &str,
-) {
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(10) {
-        if client
-            .get_session(session_id.to_string())
-            .ok()
-            .flatten()
-            .and_then(|snapshot| snapshot.lifecycle_projection.parent_id)
-            .as_deref()
-            == Some(parent_id)
-        {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    let latest_parent = client
-        .get_session(session_id.to_string())
-        .ok()
-        .flatten()
-        .and_then(|snapshot| snapshot.lifecycle_projection.parent_id);
-    panic!(
-        "session parent was not applied within 10s; session={session_id}; expected_parent={parent_id}; latest_parent={latest_parent:?}"
-    );
 }
 
 fn command_run_tool_schema() -> Value {

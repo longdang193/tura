@@ -458,6 +458,13 @@ Provider call orchestration lives in `provider_flow/call.rs`; provider request
 options and message normalization live in `provider_flow/request_options.rs`.
 `runtime/call_runtime.rs` re-exports the provider call entrypoint.
 
+Runtime does not author `prompt_cache_key`. Direct provider traffic relies on
+provider-managed implicit caching; proxied traffic receives its explicit key
+from the proxy's stable-prefix owner. Runtime also keeps the serialized
+`command_run` schema invariant across startup, active, and final turns for one
+capability set. Startup task-state and permission checks remain execution-time
+guards in `tool_flow`, not provider-schema mutations.
+
 ## Child Sub-Session Dispatch
 
 When the manas loop produces a `TaskStep` carrying `step_agent_name` (from a

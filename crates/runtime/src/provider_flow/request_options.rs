@@ -1,11 +1,7 @@
 use crate::context::USER_AGENT_CONTEXT_ROLE;
 use crate::profile_timings;
-use crate::session_log_client::SessionLogClient;
-use lifecycle::SessionId;
 use std::time::Instant;
-use tura_llm_rust::{openai_compatible_usage_stream_supported, prompt_cache_key_supported};
-
-const COMMAND_RUN_TOOL_NAME: &str = "command_run";
+use tura_llm_rust::openai_compatible_usage_stream_supported;
 
 pub(crate) fn normalize_provider_messages(
     messages: Vec<serde_json::Value>,
@@ -160,63 +156,6 @@ pub(crate) fn session_reasoning_effort() -> Option<String> {
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
 }
 
-pub(crate) fn prompt_cache_key(
-    route_config: &tura_llm_rust::RouteConfig,
-    route_name: &str,
-    session_id: &SessionId,
-    tools: &[serde_json::Value],
-) -> Option<String> {
-    let provider = route_config.providers.first()?;
-    if !prompt_cache_key_supported(&provider.provider, &provider.base_url) {
-        return None;
-    }
-    let mut tool_names = tools
-        .iter()
-        .filter_map(tool_name)
-        .filter(|name| name != COMMAND_RUN_TOOL_NAME)
-        .collect::<Vec<_>>();
-    tool_names.sort();
-    let tool_sig = tool_names.join(",");
-    let cache_session_id = prompt_cache_session_id(session_id);
-    let hash_input = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        route_name, cache_session_id, provider.provider, provider.model, tool_sig
-    );
-    Some(format!(
-        "turaosv2:{}:{}:{}",
-        short_key_part(route_name),
-        short_key_part(&cache_session_id),
-        fnv1a64_hex(&hash_input)
-    ))
-}
-
-fn prompt_cache_session_id(session_id: &SessionId) -> String {
-    let client = match SessionLogClient::discover() {
-        Ok(client) => client,
-        Err(_) => return session_id.to_string(),
-    };
-    let mut current = session_id.to_string();
-    let mut seen = std::collections::HashSet::new();
-    loop {
-        if !seen.insert(current.clone()) {
-            return session_id.to_string();
-        }
-        let snapshot = match client.get_session(current.clone()) {
-            Ok(Some(snapshot)) => snapshot,
-            _ => return current,
-        };
-        let Some(parent_id) = snapshot
-            .lifecycle_projection
-            .parent_id
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        else {
-            return current;
-        };
-        current = parent_id;
-    }
-}
-
 pub(crate) fn stream_options(
     route_config: &tura_llm_rust::RouteConfig,
     stream: bool,
@@ -229,40 +168,6 @@ pub(crate) fn stream_options(
         return None;
     }
     Some(serde_json::json!({ "include_usage": true }))
-}
-
-fn tool_name(tool: &serde_json::Value) -> Option<String> {
-    tool.get("function")
-        .and_then(|function| function.get("name"))
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| tool.get("name").and_then(serde_json::Value::as_str))
-        .map(ToString::to_string)
-}
-
-fn short_key_part(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .chars()
-        .take(24)
-        .collect()
-}
-
-fn fnv1a64_hex(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
 }
 
 pub(crate) fn parallel_tool_calls_enabled(
@@ -374,8 +279,8 @@ fn provider_base_url(settings: &tura_llm_rust::Settings, provider: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_provider_messages, prompt_cache_key, session_model_override_route,
-        session_reasoning_effort, session_service_tier, stream_options,
+        normalize_provider_messages, session_model_override_route, session_reasoning_effort,
+        session_service_tier, stream_options,
     };
     use std::collections::HashMap;
     use std::ffi::OsString;
@@ -384,7 +289,6 @@ mod tests {
 
     const REASONING_ENV: &str = "TURA_SESSION_REASONING_EFFORT";
     const ACCEL_ENV: &str = "TURA_SESSION_ACCELERATION_ENABLED";
-    const DISABLE_CACHE_ENV: &str = "TURA_DISABLE_PROMPT_CACHE";
     const MODEL_OVERRIDE_ENV: &str = "TURA_SESSION_MODEL_OVERRIDE";
 
     fn with_env<T>(name: &str, value: Option<&str>, run: impl FnOnce() -> T) -> T {
@@ -519,84 +423,6 @@ mod tests {
                 assert_eq!(provider.base_url, "https://google.test/v1beta");
             },
         );
-    }
-
-    #[test]
-    fn prompt_cache_key_is_stable_for_openai_toolsets() {
-        let route = openai_route();
-        let tools_a = vec![
-            serde_json::json!({"type":"function","function":{"name":"command_run","parameters":{"type":"object"}}}),
-        ];
-        let tools_b = vec![
-            serde_json::json!({"type":"function","function":{"name":"command_run","parameters":{"type":"object"}}}),
-        ];
-
-        with_env(DISABLE_CACHE_ENV, None, || {
-            assert_eq!(
-                prompt_cache_key(&route, "thinking", &"sess-a".to_string(), &tools_a),
-                prompt_cache_key(&route, "thinking", &"sess-a".to_string(), &tools_b)
-            );
-            assert!(
-                prompt_cache_key(&route, "thinking", &"sess-a".to_string(), &tools_a)
-                    .expect("prompt cache key should be generated")
-                    .starts_with("turaosv2:thinking:sess-a:")
-            );
-            assert_ne!(
-                prompt_cache_key(&route, "thinking", &"sess-a".to_string(), &tools_a),
-                prompt_cache_key(&route, "thinking", &"sess-b".to_string(), &tools_a)
-            );
-        });
-    }
-
-    #[test]
-    fn prompt_cache_key_is_generated_for_codex_routes() {
-        let route = tura_llm_rust::RouteConfig {
-            default_temperature: 0.2,
-            providers: vec![tura_llm_rust::ProviderConfig {
-                provider: "codex".to_string(),
-                base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-                model: "gpt-5.5".to_string(),
-                temperature: 0.2,
-            }],
-        };
-
-        with_env(DISABLE_CACHE_ENV, None, || {
-            assert!(
-                prompt_cache_key(&route, "thinking", &"sess-a".to_string(), &[])
-                    .expect("codex routes should use prompt cache keys")
-                    .starts_with("turaosv2:thinking:sess-a:")
-            );
-        });
-    }
-
-    #[test]
-    fn prompt_cache_key_is_omitted_for_non_openai_providers() {
-        let route = tura_llm_rust::RouteConfig {
-            default_temperature: 0.2,
-            providers: vec![tura_llm_rust::ProviderConfig {
-                provider: "minimax".to_string(),
-                base_url: "https://api.minimax.io/v1".to_string(),
-                model: "abab".to_string(),
-                temperature: 0.2,
-            }],
-        };
-        with_env(DISABLE_CACHE_ENV, None, || {
-            assert_eq!(
-                prompt_cache_key(&route, "thinking", &"sess-a".to_string(), &[]),
-                None
-            );
-        });
-    }
-
-    #[test]
-    fn prompt_cache_key_can_be_disabled() {
-        let route = openai_route();
-        with_env(DISABLE_CACHE_ENV, Some("true"), || {
-            assert_eq!(
-                prompt_cache_key(&route, "thinking", &"sess-a".to_string(), &[]),
-                None
-            );
-        });
     }
 
     #[test]

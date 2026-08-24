@@ -11,16 +11,15 @@ use super::constants::{
 
 pub(super) fn load_agent_capabilities_with_commands(
     agent: &AgentManagement,
-    session: &SessionManagement,
+    _session: &SessionManagement,
     allowed_commands: &BTreeSet<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    load_agent_capabilities_for_task_state(agent, allowed_commands, session.task_type.is_empty())
+    load_agent_capabilities_for_task_state(agent, allowed_commands)
 }
 
 fn load_agent_capabilities_for_task_state(
     agent: &AgentManagement,
     allowed_commands: &BTreeSet<String>,
-    require_startup_task_state: bool,
 ) -> Result<Vec<serde_json::Value>, String> {
     let Some(command_run_directory) = command_run_capability_directory(agent)? else {
         return Ok(Vec::new());
@@ -40,7 +39,7 @@ fn load_agent_capabilities_for_task_state(
     Ok(vec![tool_interface_to_provider_schema_with_commands(
         interface,
         Some(allowed_commands),
-        require_startup_task_state,
+        false,
     )])
 }
 
@@ -1402,9 +1401,17 @@ max_timeout_ms = 2000
             std::env::set_var("TURA_COMMAND_RUN_SHELL", "shell_command")
         };
         let session = session_with_task_type(vec!["debug".to_string()]);
+        let startup_session = session_with_task_type(Vec::new());
         let allowed_commands = command_run_commands_for_agent(&agent);
         let tools = load_agent_capabilities_with_commands(&agent, &session, &allowed_commands)
             .expect("tool loading should succeed");
+        let startup_tools =
+            load_agent_capabilities_with_commands(&agent, &startup_session, &allowed_commands)
+                .expect("startup tool loading should succeed");
+        assert_eq!(
+            startup_tools, tools,
+            "startup and active command_run schemas must remain identical"
+        );
         let command_run = tools.first().expect("command_run tool should load");
         assert_command_type_enum(
             command_run,
