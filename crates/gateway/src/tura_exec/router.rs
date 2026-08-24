@@ -511,6 +511,7 @@ pub(crate) fn worker_env_from_current_process() -> serde_json::Map<String, Value
         "TURA_COMMAND_RUN_SANDBOX",
         "TURA_COMMAND_RUN_STRICT_JSON",
         "TURA_COMMAND_RUN_DISABLE_STRICT_JSON",
+        "TURA_BENCH_FORCE_COMMAND_RUN",
         "TURA_FORCED_CAPABILITY_DIRECTORIES",
         "TURA_MCP_STDIO_BRIDGE_BIN",
         "TURA_MCP_SERVER_COMMAND",

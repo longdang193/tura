@@ -32,7 +32,7 @@ pub(crate) fn execute_turn(
     original_user_task: &str,
     extra_tail_system_prompt: Option<&'static str>,
     _redis_url: &str,
-    _is_first_llm_call: bool,
+    is_first_llm_call: bool,
     is_final_turn: bool,
     force_no_tools: bool,
     runtime_id: Option<RuntimeId>,
@@ -165,7 +165,7 @@ pub(crate) fn execute_turn(
                 provider_name: queue_item.provider_name,
                 stream: agent.provider.stream,
                 max_tokens: agent.provider.max_tokens,
-                tool_choice: tool_choice_for_turn(),
+                tool_choice: tool_choice_for_turn(is_first_llm_call),
                 session_directory: session.session_directory.clone(),
                 allowed_command_run_commands: Some(agent_commands),
                 require_startup_task_state,
@@ -366,7 +366,15 @@ fn debug_runtime_timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn tool_choice_for_turn() -> Option<serde_json::Value> {
+fn tool_choice_for_turn(is_first_llm_call: bool) -> Option<serde_json::Value> {
+    if is_first_llm_call
+        && std::env::var("TURA_BENCH_FORCE_COMMAND_RUN").ok().as_deref() == Some("1")
+    {
+        return Some(serde_json::json!({
+            "type": "function",
+            "function": { "name": COMMAND_RUN_TOOL }
+        }));
+    }
     Some(serde_json::json!("auto"))
 }
 
@@ -427,7 +435,33 @@ mod tests {
 
     #[test]
     fn turns_use_auto_tool_choice_for_prompt_cache_stability() {
-        assert_eq!(tool_choice_for_turn(), Some(serde_json::json!("auto")));
+        assert_eq!(tool_choice_for_turn(false), Some(serde_json::json!("auto")));
+    }
+
+    #[test]
+    fn benchmark_forces_command_run_only_on_first_llm_call() {
+        let _guard = crate::manas::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let previous = std::env::var_os("TURA_BENCH_FORCE_COMMAND_RUN");
+        // SAFETY: the test holds the shared environment lock.
+        #[allow(
+            unsafe_code,
+            reason = "Rust 2024 process-environment mutation audited at the caller"
+        )]
+        unsafe {
+            std::env::set_var("TURA_BENCH_FORCE_COMMAND_RUN", "1")
+        };
+
+        assert_eq!(
+            tool_choice_for_turn(true),
+            Some(serde_json::json!({
+                "type": "function",
+                "function": { "name": COMMAND_RUN_TOOL }
+            }))
+        );
+        assert_eq!(tool_choice_for_turn(false), Some(serde_json::json!("auto")));
+        restore_env("TURA_BENCH_FORCE_COMMAND_RUN", previous);
     }
 
     #[test]

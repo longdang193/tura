@@ -458,9 +458,9 @@ Provider call orchestration lives in `provider_flow/call.rs`; provider request
 options and message normalization live in `provider_flow/request_options.rs`.
 `runtime/call_runtime.rs` re-exports the provider call entrypoint.
 
-Runtime does not author `prompt_cache_key`. Direct provider traffic relies on
-provider-managed implicit caching; proxied traffic receives its explicit key
-from the proxy's stable-prefix owner. Runtime also keeps the serialized
+Runtime does not author `prompt_cache_key`. Direct provider traffic and current
+pure-forward proxied traffic rely on provider-managed implicit caching. An explicit
+cache-key owner requires separate architecture approval and provider-evidence A/B. Runtime also keeps the serialized
 `command_run` schema invariant across startup, active, and final turns for one
 capability set. Startup task-state and permission checks remain execution-time
 guards in `tool_flow`, not provider-schema mutations.

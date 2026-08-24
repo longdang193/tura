@@ -339,6 +339,12 @@ pub(crate) fn spawn_streamed_command_run_task(
             } else {
                 "completed"
             };
+            if std::env::var("TURA_DEBUG_RUNTIME").is_ok() {
+                eprintln!(
+                    "tura runtime debug: command_run completed results={} status={command_run_status}",
+                    final_results.len()
+                );
+            }
             if let Err(error) = checkpointing::command_run_finished(
                 &input.session_id,
                 &input.runtime_id,
