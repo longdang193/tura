@@ -34,13 +34,14 @@ const CODEX_PROMPT = [
 ].join(" ");
 
 function parseArgs(argv) {
-  const values = { arms: ["T", "TL"], repetitions: 10, outputDir: null, selfTest: false };
+  const values = { arms: ["T", "TL"], repetitions: 10, outputDir: null, workspaceCase: "unchanged", selfTest: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--self-test") values.selfTest = true;
     else if (arg === "--arms") values.arms = argv[++index].split(",").map((value) => value.trim()).filter(Boolean);
     else if (arg === "--repetitions") values.repetitions = Number(argv[++index]);
     else if (arg === "--output-dir") values.outputDir = resolve(argv[++index]);
+    else if (arg === "--workspace-case") values.workspaceCase = argv[++index];
     else if (arg === "--tura-root") values.turaRoot = resolve(argv[++index]);
     else if (arg === "--lightrsi-root") values.lightrsiRoot = resolve(argv[++index]);
     else if (arg === "--tura-bin") values.turaBin = resolve(argv[++index]);
@@ -60,6 +61,7 @@ function parseArgs(argv) {
   if (!Number.isInteger(values.repetitions) || values.repetitions < 1) throw new Error("--repetitions must be a positive integer");
   if (values.arms.length === 0) throw new Error("--arms must include L, T, or TL");
   if (!values.arms.every((arm) => arm === "L" || arm === "T" || arm === "TL")) throw new Error("--arms accepts only L, T, and TL");
+  if (!["unchanged", "tracked-source", "generated-git", "different-path"].includes(values.workspaceCase)) throw new Error("--workspace-case accepts unchanged, tracked-source, generated-git, or different-path");
   return values;
 }
 
@@ -73,6 +75,64 @@ function stableStringify(value) {
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function firstDivergence(left, right) {
+  const leftText = String(left);
+  const rightText = String(right);
+  const leftBytes = Buffer.from(leftText, "utf8");
+  const rightBytes = Buffer.from(rightText, "utf8");
+  const limit = Math.min(leftBytes.length, rightBytes.length);
+  let byteOffset = 0;
+  while (byteOffset < limit && leftBytes[byteOffset] === rightBytes[byteOffset]) byteOffset += 1;
+  const leftChars = [...leftText];
+  const rightChars = [...rightText];
+  const charLimit = Math.min(leftChars.length, rightChars.length);
+  let characterOffset = 0;
+  while (characterOffset < charLimit && leftChars[characterOffset] === rightChars[characterOffset]) characterOffset += 1;
+  return {
+    common_prefix_bytes: byteOffset,
+    first_divergence_byte: byteOffset < Math.max(leftBytes.length, rightBytes.length) ? byteOffset : null,
+    first_divergence_character: characterOffset < Math.max(leftChars.length, rightChars.length) ? characterOffset : null,
+  };
+}
+
+function payloadMetadataFromBody(body) {
+  const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body);
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { parsed = undefined; }
+  const objectPayload = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  return {
+    payload_is_json: parsed !== undefined,
+    payload_model: typeof objectPayload?.model === "string" ? objectPayload.model : null,
+    prompt_cache_key_present: Boolean(objectPayload && Object.hasOwn(objectPayload, "prompt_cache_key")),
+    payload_top_level_keys: objectPayload ? Object.keys(objectPayload).sort() : [],
+  };
+}
+
+function firstDifferentTopLevelField(left, right) {
+  let leftPayload;
+  let rightPayload;
+  try { leftPayload = JSON.parse(String(left)); rightPayload = JSON.parse(String(right)); } catch { return null; }
+  if (!leftPayload || !rightPayload || typeof leftPayload !== "object" || typeof rightPayload !== "object" || Array.isArray(leftPayload) || Array.isArray(rightPayload)) return null;
+  const keys = [...new Set([...Object.keys(leftPayload), ...Object.keys(rightPayload)])].sort();
+  return keys.find((key) => stableStringify(leftPayload[key]) !== stableStringify(rightPayload[key])) ?? null;
+}
+function compareProviderRequests(leftRequests, rightRequests) {
+  const count = Math.max(leftRequests.length, rightRequests.length);
+  return {
+    request_count_equal: leftRequests.length === rightRequests.length,
+    comparisons: Array.from({ length: count }, (_, index) => {
+      const left = leftRequests[index];
+      const right = rightRequests[index];
+      return {
+        index,
+        left: left ? { method: left.method, path: left.path, payload_digest: left.payload_digest, payload_model: left.payload_model, prompt_cache_key_present: left.prompt_cache_key_present } : null,
+        right: right ? { method: right.method, path: right.path, payload_digest: right.payload_digest, payload_model: right.payload_model, prompt_cache_key_present: right.prompt_cache_key_present } : null,
+        first_divergence: left && right ? { ...firstDivergence(left._body, right._body), top_level_field: firstDifferentTopLevelField(left._body, right._body) } : null,
+      };
+    }),
+  };
 }
 
 function parseJsonLines(text) {
@@ -123,6 +183,7 @@ function snapshotStatsFromBody(body) {
     tool_schema_digest: tools === undefined ? null : hashText(stableStringify(tools)),
     tool_choice: toolChoice === undefined ? null : stableStringify(toolChoice),
     payload_digest: hashText(text),
+    ...payloadMetadataFromBody(body),
   };
 }
 
@@ -336,6 +397,7 @@ async function startDiagnosticRelay(providerUrl) {
     let settleResponse;
     const responseSettled = new Promise((resolve) => { settleResponse = resolve; });
     const record = { relay_request_id: `${Date.now()}-${requests.length + 1}`, method: request.method || "POST", path: request.url || "/", request_bytes: body.length, request_complete_ms: requestComplete - requestStart, dispatch_ms: dispatch - requestStart, response_status: 599, response_bytes: 0, headers_ms: null, first_chunk_ms: null, last_chunk_ms: null, downstream_finish_ms: null, outcome: "pending", ...snapshotStatsFromBody(body), ...forwardedHeaderStats(forwardedHeaders) };
+    Object.defineProperty(record, "_body", { value: body.toString("utf8"), enumerable: false });
     requests.push(record);
     request.once("aborted", () => { requestAborted = true; record.request_aborted = true; });
     response.once("finish", () => { record.downstream_finish_ms = performance.now() - dispatch; settleResponse(); });
@@ -446,6 +508,19 @@ async function writeBenchmarkAgent(projectRoot, turaRoot) {
   }));
 }
 
+async function applyWorkspaceCase(fixture, workspaceCase) {
+  if (workspaceCase === "unchanged" || workspaceCase === "different-path") return;
+  if (workspaceCase === "tracked-source") {
+    const sourcePath = join(fixture, "README.md");
+    const source = await readFile(sourcePath);
+    await writeFile(sourcePath, Buffer.concat([source, Buffer.from("\nbenchmark tracked-source mutation\n")]))
+    return;
+  }
+  await mkdir(join(fixture, "target"), { recursive: true });
+  await writeFile(join(fixture, "target", "benchmark-generated.txt"), "benchmark generated mutation\n");
+  await mkdir(join(fixture, ".git", "benchmark-generated"), { recursive: true });
+  await writeFile(join(fixture, ".git", "benchmark-generated", "marker"), "benchmark git mutation\n");
+}
 async function restoreWorkspace(fixture, workspace) {
   await rm(workspace, { recursive: true, force: true });
   await cp(fixture, workspace, { recursive: true, preserveTimestamps: true, force: true });
@@ -536,6 +611,13 @@ async function selfTest() {
   const fakeBody = JSON.stringify({ tools: [{ type: "function", name: "command_run" }], input: [{ content: `${SNAPSHOT_START}\nnode_modules/\nsrc/\n${SNAPSHOT_END}` }] });
   const stats = snapshotStatsFromBody(fakeBody);
   if (stats.snapshot_bytes <= 0 || stats.category_lines.node_modules !== 1 || stats.tool_schema_digest === null) throw new Error("snapshot self-test failed");
+  const equal = firstDivergence("same", "same");
+  const prefix = firstDivergence("prefix-a", "prefix-b");
+  const unicode = firstDivergence("a😀", "a😃");
+  if (equal.first_divergence_byte !== null || prefix.first_divergence_byte !== 7 || unicode.first_divergence_character !== 1) throw new Error("divergence self-test failed");
+  const metadata = payloadMetadataFromBody(JSON.stringify({ model: "m", prompt_cache_key: "k", input: [] }));
+  if (metadata.payload_model !== "m" || !metadata.prompt_cache_key_present || !metadata.payload_top_level_keys.includes("model")) throw new Error("payload metadata self-test failed");
+  if (firstDifferentTopLevelField(JSON.stringify({ model: "m", input: [1] }), JSON.stringify({ model: "m", input: [2] })) !== "input") throw new Error("top-level divergence self-test failed");
   const output = verifyTuraOutput([
     JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "pwd" } }),
     ...Array.from({ length: 9 }, (_, index) => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `read-${index}` } })),
@@ -574,6 +656,7 @@ async function liveRun(options) {
     await mkdir(codexHome, { recursive: true });
     await cp(authFile, join(codexHome, "auth.json"), { preserveTimestamps: false, force: true });
     execFileSync("git", ["clone", "--local", "--no-hardlinks", options.lightrsiRoot, fixture], { windowsHide: true, stdio: "ignore" });
+    await applyWorkspaceCase(fixture, options.workspaceCase);
     await mkdir(join(projectRoot, "crates"), { recursive: true });
     await cp(join(options.turaRoot, "crates", "tools"), join(projectRoot, "crates", "tools"), { recursive: true, preserveTimestamps: true, force: true });
     await writeBenchmarkAgent(projectRoot, options.turaRoot);
@@ -593,18 +676,19 @@ async function liveRun(options) {
       }
       const pairFamily = `tura-tl-${Date.now()}-${repetition}`;
       for (const arm of order) {
-        await restoreWorkspace(fixture, workspace);
-        const beforeStatus = statusSnapshot(workspace);
+        const currentWorkspace = options.workspaceCase === "different-path" ? join(tempRoot, `workspace-${arm.toLowerCase()}`) : workspace;
+        await restoreWorkspace(fixture, currentWorkspace);
+        const beforeStatus = statusSnapshot(currentWorkspace);
         const beforeRequests = relay.requests.length;
         const traceBefore = (await stat(tracePath).catch(() => ({ size: 0 }))).size;
         const prompt = `${arm === "L" ? CODEX_PROMPT : TURA_PROMPT} Benchmark family: ${pairFamily}.`;
         const result = arm === "L"
-          ? await runCodex({ binary: options.codexBin, workspace, model: options.model, apiKey, prompt, providerUrl: `http://127.0.0.1:${proxyPort}/v1`, codexHome })
-          : await runTura({ binary: options.turaBin, workspace, projectRoot, configPath: arm === "T" ? configDirect : configProxy, sessionId: `tl-benchmark-${repetition}-${arm}`, agentId: options.agentId, model: options.model, apiKey, prompt, turaHome, turaDbRoot });
+          ? await runCodex({ binary: options.codexBin, workspace: currentWorkspace, model: options.model, apiKey, prompt, providerUrl: `http://127.0.0.1:${proxyPort}/v1`, codexHome })
+          : await runTura({ binary: options.turaBin, workspace: currentWorkspace, projectRoot, configPath: arm === "T" ? configDirect : configProxy, sessionId: `tl-benchmark-${repetition}-${arm}`, agentId: options.agentId, model: options.model, apiKey, prompt, turaHome, turaDbRoot });
         if (arm !== "L") await shutdownRouter(turaDbRoot);
         await relay.waitForIdle();
         await new Promise((resolveWait) => setTimeout(resolveWait, 1000));
-        const afterStatus = statusSnapshot(workspace);
+        const afterStatus = statusSnapshot(currentWorkspace);
         const providerRequests = relay.requests.slice(beforeRequests);
         const traceRows = arm === "T" ? [] : await waitForTrace(tracePath, traceBefore, providerRequests.length, 15000);
         const forwardRows = traceRows.filter((row) => ["pure_forward_timing", "pure_forward_cancelled", "pure_forward_failed"].includes(row.stage));
@@ -616,14 +700,18 @@ async function liveRun(options) {
         const accountingComplete = providerRequests.every((request) => request.outcome !== "pending") && (arm === "T" || forwardRows.length === providerRequests.length);
         const strictPass = result.exit === 0 && !result.timed_out && result.exact_ten_tools && result.final_marker && !result.unsafe_command_detected && beforeStatus === afterStatus && providerCompletedRequests.length > 0 && providerFailedRequests.length === 0 && accountingComplete && (arm === "T" || completeForwardRows.length >= providerRequests.length && !forwardRows.some((row) => row.stage === "pure_forward_failed"));
         const firstRequest = providerRequests[0];
+        const previousArmRecord = records.find((record) => record.repetition === repetition && record.arm !== arm);
+        const matchedPayloadComparison = previousArmRecord ? { left_arm: previousArmRecord.arm, right_arm: arm, ...compareProviderRequests(previousArmRecord._provider_requests, providerRequests) } : null;
         const workerDiagnostic = arm === "L" ? "" : await readFile(join(turaHome, "worker.stderr.log"), "utf8").catch(() => "");
-        const record = { benchmark: "tura-tl-efficiency", arm, runner: arm === "L" ? "codex" : "tura", repetition, phase: repetition === 1 ? "workload-cold" : "workload-warm", pair_order: order.join("->"), pair_position: order.indexOf(arm) + 1, strict_pass: strictPass, accounting_complete: accountingComplete, provider_requests: providerRequests.length, provider_completed_requests: providerCompletedRequests.length, provider_cancelled_requests: providerCancelledRequests.length, provider_failed_requests: providerFailedRequests.length, provider_statuses: Object.fromEntries(providerRequests.map((request) => [String(request.response_status), (providerRequests.filter((item) => item.response_status === request.response_status).length)])), request_bytes: providerRequests.reduce((sum, request) => sum + request.request_bytes, 0), response_bytes: providerRequests.reduce((sum, request) => sum + request.response_bytes, 0), snapshot_bytes: firstRequest?.snapshot_bytes ?? 0, snapshot_digest: firstRequest?.snapshot_digest ?? null, category_bytes: firstRequest?.category_bytes ?? {}, tool_schema_digest: firstRequest?.tool_schema_digest ?? null, tool_choice: firstRequest?.tool_choice ?? null, forwarded_header_names: firstRequest?.forwarded_header_names ?? [], forwarded_header_fingerprint: firstRequest?.forwarded_header_fingerprint ?? null, tool_choices: providerRequests.map((request) => request.tool_choice), provider_responses: providerRequests.map((request) => request.provider_response), provider_request_usage: providerRequests.map((request) => request.provider_usage).filter(Boolean), payload_digests: providerRequests.map((request) => request.payload_digest), input_tokens: result.usage.input_tokens, cached_input_tokens: result.usage.cached_input_tokens, uncached_input_tokens: result.usage.uncached_input_tokens, output_tokens: result.usage.output_tokens, latency_ms: result.elapsed_ms, first_output_ms: result.first_output_ms, relay_first_chunk_ms: firstRequest?.first_chunk_ms ?? null, relay_last_chunk_ms: firstRequest?.last_chunk_ms ?? null, light_forward_rows: forwardRows.length, trace_stages: traceRows.map((row) => row.stage), trace_error_classes: traceRows.map((row) => row.errorClass).filter(Boolean), trace_abort_sources: traceRows.map((row) => row.abortSource).filter(Boolean), tool_name: result.tool_name, exact_ten_tools: result.exact_ten_tools, final_marker: result.final_marker, unsafe_command_detected: result.unsafe_command_detected, item_type_counts: result.item_type_counts, command_shapes: result.command_shapes, diagnostic: redactedDiagnostic(result.stderr), worker_diagnostic: redactedDiagnostic(workerDiagnostic), router_diagnostic: redactedDiagnostic(await readFile(join(turaHome, "router.stderr.log"), "utf8").catch(() => "")), git_status_before: beforeStatus, git_status_after: afterStatus, git_status_unchanged: beforeStatus === afterStatus, exit: result.exit, timed_out: result.timed_out };
+        const record = { benchmark: "tura-tl-efficiency", workspace_case: options.workspaceCase, arm, runner: arm === "L" ? "codex" : "tura", repetition, phase: repetition === 1 ? "workload-cold" : "workload-warm", pair_order: order.join("->"), pair_position: order.indexOf(arm) + 1, strict_pass: strictPass, accounting_complete: accountingComplete, provider_requests: providerRequests.length, provider_completed_requests: providerCompletedRequests.length, provider_cancelled_requests: providerCancelledRequests.length, provider_failed_requests: providerFailedRequests.length, provider_statuses: Object.fromEntries(providerRequests.map((request) => [String(request.response_status), (providerRequests.filter((item) => item.response_status === request.response_status).length)])), request_bytes: providerRequests.reduce((sum, request) => sum + request.request_bytes, 0), response_bytes: providerRequests.reduce((sum, request) => sum + request.response_bytes, 0), snapshot_bytes: firstRequest?.snapshot_bytes ?? 0, snapshot_digest: firstRequest?.snapshot_digest ?? null, category_bytes: firstRequest?.category_bytes ?? {}, tool_schema_digest: firstRequest?.tool_schema_digest ?? null, tool_choice: firstRequest?.tool_choice ?? null, forwarded_header_names: firstRequest?.forwarded_header_names ?? [], forwarded_header_fingerprint: firstRequest?.forwarded_header_fingerprint ?? null, tool_choices: providerRequests.map((request) => request.tool_choice), provider_responses: providerRequests.map((request) => request.provider_response), provider_request_usage: providerRequests.map((request) => request.provider_usage).filter(Boolean), provider_request_paths: providerRequests.map((request) => request.path), provider_request_methods: providerRequests.map((request) => request.method), provider_request_models: providerRequests.map((request) => request.payload_model), provider_request_cache_key_present: providerRequests.map((request) => request.prompt_cache_key_present), models_request_count: providerRequests.filter((request) => request.path.endsWith("/models")).length, payload_digests: providerRequests.map((request) => request.payload_digest), payload_metadata: providerRequests.map((request) => ({ payload_is_json: request.payload_is_json, payload_model: request.payload_model, prompt_cache_key_present: request.prompt_cache_key_present, payload_top_level_keys: request.payload_top_level_keys })), within_chain_divergences: providerRequests.slice(1).map((request, index) => firstDivergence(providerRequests[index]._body, request._body)), matched_payload_comparison: matchedPayloadComparison, input_tokens: result.usage.input_tokens, cached_input_tokens: result.usage.cached_input_tokens, uncached_input_tokens: result.usage.uncached_input_tokens, output_tokens: result.usage.output_tokens, latency_ms: result.elapsed_ms, first_output_ms: result.first_output_ms, relay_first_chunk_ms: firstRequest?.first_chunk_ms ?? null, relay_last_chunk_ms: firstRequest?.last_chunk_ms ?? null, light_forward_rows: forwardRows.length, trace_stages: traceRows.map((row) => row.stage), trace_error_classes: traceRows.map((row) => row.errorClass).filter(Boolean), trace_abort_sources: traceRows.map((row) => row.abortSource).filter(Boolean), tool_name: result.tool_name, exact_ten_tools: result.exact_ten_tools, final_marker: result.final_marker, unsafe_command_detected: result.unsafe_command_detected, item_type_counts: result.item_type_counts, command_shapes: result.command_shapes, diagnostic: redactedDiagnostic(result.stderr), worker_diagnostic: redactedDiagnostic(workerDiagnostic), router_diagnostic: redactedDiagnostic(await readFile(join(turaHome, "router.stderr.log"), "utf8").catch(() => "")), git_status_before: beforeStatus, git_status_after: afterStatus, git_status_unchanged: beforeStatus === afterStatus, exit: result.exit, timed_out: result.timed_out };
+        Object.defineProperty(record, "_provider_requests", { value: providerRequests, enumerable: false });
+        if (previousArmRecord) previousArmRecord.matched_payload_comparison = matchedPayloadComparison;
         records.push(record);
         console.log(JSON.stringify(record));
       }
     }
     const arms = Object.fromEntries(options.arms.map((arm) => [arm, aggregate(records.filter((record) => record.arm === arm))]));
-    const summary = { benchmark: "tura-tl-efficiency", repetitions_per_arm: options.repetitions, records: records.length, arms, records_redacted: records, p95_is_diagnostic: true };
+    const summary = { benchmark: "tura-tl-efficiency", workspace_case: options.workspaceCase, repetitions_per_arm: options.repetitions, records: records.length, arms, records_redacted: records, p95_is_diagnostic: true };
     const outputDir = options.outputDir || join(tempRoot, "evidence");
     await mkdir(outputDir, { recursive: true });
     await writeFile(join(outputDir, "records.jsonl"), records.map((record) => JSON.stringify(record)).join("\n") + "\n");

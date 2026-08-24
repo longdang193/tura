@@ -311,7 +311,7 @@ async fn runtime_openai_business_flow_replays_final_command_run_once_and_records
     assert_eq!(
         captured.body["prompt_cache_key"],
         Value::Null,
-        "local OpenAI-compatible routes should not get a prompt cache key"
+        "unsupported local provider should not get a prompt cache key"
     );
     assert_llm_boundary_fixture(
         captured,
@@ -363,7 +363,7 @@ async fn runtime_openai_business_flow_replays_final_command_run_once_and_records
     assert_eq!(runtime_input["options"]["tool_choice"], "auto");
     assert_eq!(
         runtime_input["options"]["prompt_cache_key"],
-        Value::Null,
+        captured.body["prompt_cache_key"],
         "runtime diagnostics should agree with the outgoing provider payload"
     );
 }
@@ -531,7 +531,7 @@ async fn runtime_http_auth_failure_is_not_retryable() {
 }
 
 #[tokio::test]
-async fn runtime_does_not_author_prompt_cache_key() {
+async fn runtime_authors_opaque_prompt_cache_key_for_supported_provider() {
     let _guard = ASYNC_ENV_LOCK.lock().await;
     let workspace = tempfile::tempdir().expect("runtime cache workspace");
 
@@ -586,11 +586,15 @@ async fn runtime_does_not_author_prompt_cache_key() {
     .expect("runtime cache call should succeed");
 
     let requests = provider.requests();
-    let cache_key = requests[0].body["prompt_cache_key"].as_str();
-    assert!(cache_key.is_none(), "Tura must not author prompt cache keys");
+    let cache_key = requests[0].body["prompt_cache_key"]
+        .as_str()
+        .expect("supported provider should receive prompt cache key");
+    assert!(cache_key.starts_with("tura-cache-v1-"));
+    assert!(!cache_key.contains("cache-session"));
+    assert!(!cache_key.contains(workspace.path().to_string_lossy().as_ref()));
     assert_eq!(
         result.input.expect("runtime input")["options"]["prompt_cache_key"],
-        Value::Null
+        cache_key
     );
 }
 

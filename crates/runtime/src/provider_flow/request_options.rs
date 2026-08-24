@@ -1,5 +1,7 @@
 use crate::context::USER_AGENT_CONTEXT_ROLE;
 use crate::profile_timings;
+use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::time::Instant;
 use tura_llm_rust::openai_compatible_usage_stream_supported;
 
@@ -234,6 +236,38 @@ pub(crate) fn route_for_provider_name(
     })
 }
 
+pub(crate) fn prompt_cache_key_for_call(
+    route_name: &str,
+    route: &tura_llm_rust::RouteConfig,
+    session_directory: &Path,
+    session_id: &str,
+) -> Option<String> {
+    if route.providers.is_empty()
+        || !route.providers.iter().all(|provider| {
+            tura_llm_rust::prompt_cache_key_supported(&provider.provider, &provider.base_url)
+        })
+    {
+        return None;
+    }
+
+    let provider_identity = route
+        .providers
+        .iter()
+        .map(|provider| format!("{}|{}|{}", provider.provider, provider.base_url, provider.model))
+        .collect::<Vec<_>>()
+        .join(";");
+    let identity = format!(
+        "tura-cache-v1\0{route_name}\0{provider_identity}\0{}\0{session_id}",
+        session_directory.to_string_lossy()
+    );
+    let digest = Sha256::digest(identity.as_bytes());
+    let suffix = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Some(format!("tura-cache-v1-{suffix}"))
+}
+
 pub(crate) fn session_model_override_route(
     settings: &tura_llm_rust::Settings,
     fallback: &tura_llm_rust::RouteConfig,
@@ -279,8 +313,8 @@ fn provider_base_url(settings: &tura_llm_rust::Settings, provider: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_provider_messages, session_model_override_route, session_reasoning_effort,
-        session_service_tier, stream_options,
+        normalize_provider_messages, prompt_cache_key_for_call, session_model_override_route,
+        session_reasoning_effort, session_service_tier, stream_options,
     };
     use std::collections::HashMap;
     use std::ffi::OsString;
@@ -470,6 +504,42 @@ mod tests {
             normalized[6]["content"],
             "Runtime context (debug):\nunknown role text"
         );
+    }
+
+    #[test]
+    fn prompt_cache_key_is_stable_opaque_and_provider_gated() {
+        with_env("TURA_DISABLE_PROMPT_CACHE", None, || {
+            let workspace = std::path::PathBuf::from("C:/workspace");
+            let key = prompt_cache_key_for_call("fast", &openai_route(), &workspace, "session-1")
+                .expect("OpenAI route should support prompt cache keys");
+            assert_eq!(
+                key,
+                prompt_cache_key_for_call("fast", &openai_route(), &workspace, "session-1")
+                    .expect("same identity should produce same key")
+            );
+            assert!(key.starts_with("tura-cache-v1-"));
+            assert!(!key.contains("workspace"));
+            assert!(!key.contains("session-1"));
+            assert_ne!(
+                key,
+                prompt_cache_key_for_call("fast", &openai_route(), &workspace, "session-2")
+                    .expect("different session should produce a key")
+            );
+
+            let unsupported = tura_llm_rust::RouteConfig {
+                default_temperature: 0.2,
+                providers: vec![tura_llm_rust::ProviderConfig {
+                    provider: "google".to_string(),
+                    base_url: "https://google.test/v1beta".to_string(),
+                    model: "gemini-test".to_string(),
+                    temperature: 0.2,
+                }],
+            };
+            assert_eq!(
+                prompt_cache_key_for_call("google", &unsupported, &workspace, "session-1"),
+                None
+            );
+        });
     }
 
     #[test]

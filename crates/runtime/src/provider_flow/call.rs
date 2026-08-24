@@ -14,7 +14,8 @@ use crate::provider_flow::provider_response::apply_provider_response;
 use crate::provider_flow::provider_streaming::{call_runtime_streaming, RuntimeStreamingInput};
 pub use crate::provider_flow::request_options::route_by_name;
 use crate::provider_flow::request_options::{
-    normalize_provider_messages, parallel_tool_calls_enabled, route_for_provider_name,
+    normalize_provider_messages, parallel_tool_calls_enabled, prompt_cache_key_for_call,
+    route_for_provider_name,
     session_max_tokens, session_model_override_route, session_reasoning_effort,
     session_service_tier, stream_options,
 };
@@ -125,6 +126,12 @@ pub(crate) async fn call_runtime_with_writer(
     let override_route = session_model_override_route(tura_settings.as_ref(), route_config_base);
     let route_config = override_route.as_ref().unwrap_or(route_config_base);
     let context_window = active_model_context_window(tura_settings.as_ref(), route_config);
+    let prompt_cache_key = prompt_cache_key_for_call(
+        &input.provider_name,
+        route_config,
+        &input.session_directory,
+        &runtime.session_id,
+    );
 
     let call_options = tura_llm_rust::CallOptions {
         tools: if input.tools.is_empty() {
@@ -134,7 +141,7 @@ pub(crate) async fn call_runtime_with_writer(
         },
         stream: Some(input.stream),
         parallel_tool_calls: parallel_tool_calls_enabled(route_config, !input_tools.is_empty()),
-        prompt_cache_key: None,
+        prompt_cache_key,
         stream_options: stream_options(route_config, input.stream),
         reasoning_effort: session_reasoning_effort(),
         service_tier: session_service_tier(),
