@@ -1,0 +1,25 @@
+{
+  "model_catalog": {
+    "tiers": ["thinking", "fast"],
+    "providers": {
+      "openai": {
+        "display_name": "LightRSI",
+        "runtime_provider": "openai",
+        "api_style": "openai_compatible",
+        "base_url": "http://127.0.0.1:17667/v1",
+        "token_env": "OPENAI_API_KEY",
+        "env": ["OPENAI_API_KEY"],
+        "domains": ["llm"],
+        "capabilities": ["llm.chat", "llm.tool_call"],
+        "auth_methods": ["api_key"],
+        "models": {"thinking": ["combo-high"], "fast": ["combo-high"]},
+        "status": "local"
+      }
+    }
+  },
+  "provider_base_url": {"openai": "http://127.0.0.1:17667/v1"},
+  "routes": {
+    "thinking": {"default_temperature": 0.2, "providers": [{"provider": "openai", "model": "combo-high"}]},
+    "fast": {"default_temperature": 0.2, "providers": [{"provider": "openai", "model": "combo-high"}]}
+  }
+}

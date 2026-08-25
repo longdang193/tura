@@ -2,10 +2,13 @@
 .env
 .env.*
 !.env.example
+*.private.*
+*.local.*
 .cargo/*
 !.cargo/config.toml
 .tura/
 .tura-router-debug/
+.deepagents/
 /tura_workspace/
 /workspace/
 /outreach/
