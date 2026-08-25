@@ -60,7 +60,19 @@ pub fn runtime_provider_config_from_tura(
     thinking: bool,
 ) -> Result<RuntimeProviderConfig, String> {
     let default_model_tier = default_model_tier(provider_config);
-    let route = route_by_name(settings, &default_model_tier)
+    let model_override = session_model_override();
+    let has_model_override = model_override.is_some();
+    let route_name = route_by_name(settings, &default_model_tier)
+        .map(|_| default_model_tier.clone())
+        .or_else(|| {
+            model_override.as_ref().and_then(|_| {
+                let fallback = if thinking { "thinking" } else { "fast" };
+                route_by_name(settings, fallback).map(|_| fallback.to_string())
+            })
+        });
+    let route = route_name
+        .as_deref()
+        .and_then(|name| route_by_name(settings, name))
         .ok_or_else(|| format!("unknown provider route: {}", default_model_tier))?;
     let primary = route.providers.first().ok_or_else(|| {
         format!(
@@ -68,7 +80,7 @@ pub fn runtime_provider_config_from_tura(
             default_model_tier
         )
     })?;
-    let selected = session_model_override()
+    let selected = model_override
         .or_else(|| explicit_current_model(provider_config))
         .and_then(|(provider, model)| {
             provider_base_url(settings, &provider).map(|base_url| tura_llm_rust::ProviderConfig {
@@ -99,8 +111,12 @@ pub fn runtime_provider_config_from_tura(
     Ok(RuntimeProviderConfig {
         base,
         thinking,
-        provider_name: explicit_current_model_value(provider_config)
-            .unwrap_or_else(|| default_model_tier.clone()),
+        provider_name: if has_model_override {
+            route_name.expect("route name exists after route resolution")
+        } else {
+            explicit_current_model_value(provider_config)
+                .unwrap_or_else(|| route_name.expect("route name exists after route resolution"))
+        },
         model_name: selected.model,
         provider_url_name: selected.base_url,
         llm_provider_name: selected.provider,

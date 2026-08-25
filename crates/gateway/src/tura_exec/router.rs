@@ -495,6 +495,7 @@ fn router_usage(response: &Value) -> Option<Value> {
 
 pub(crate) fn worker_env_from_current_process() -> serde_json::Map<String, Value> {
     const KEYS: &[&str] = &[
+        "TURA_SESSION_MODEL_OVERRIDE",
         "TURA_SESSION_REASONING_EFFORT",
         "TURA_SESSION_ACCELERATION_ENABLED",
         "TURA_SESSION_MAX_TOKENS",
@@ -755,6 +756,7 @@ mod tests {
     #[test]
     fn worker_env_from_current_process_keeps_only_documented_nonempty_keys() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let previous_model_override = std::env::var_os("TURA_SESSION_MODEL_OVERRIDE");
         let previous_model = std::env::var_os("TURA_SESSION_MAX_TOKENS");
         let previous_goal = std::env::var_os("TURA_GOAL_MODE");
         let previous_no_op = std::env::var_os("TURA_NO_OP_MANUAL");
@@ -765,6 +767,14 @@ mod tests {
         let legacy_timeout_key = ["TURA_WORKER", "INVOKE_TIMEOUT_SECS"].join("_");
         let previous_timeout = std::env::var_os(&legacy_timeout_key);
 
+        // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
+        #[allow(
+            unsafe_code,
+            reason = "Rust 2024 process-environment mutation audited at the caller"
+        )]
+        unsafe {
+            std::env::set_var("TURA_SESSION_MODEL_OVERRIDE", "openai/combo-high")
+        };
         // SAFETY: the caller ensures no concurrent foreign environment access races with this mutation.
         #[allow(
             unsafe_code,
@@ -835,6 +845,10 @@ mod tests {
 
         let env = worker_env_from_current_process();
 
+        assert_eq!(
+            env.get("TURA_SESSION_MODEL_OVERRIDE"),
+            Some(&json!("openai/combo-high"))
+        );
         assert_eq!(env.get("TURA_SESSION_MAX_TOKENS"), Some(&json!("4096")));
         assert_eq!(env.get("TURA_GOAL_MODE"), Some(&json!("1")));
         assert_eq!(env.get("TURA_NO_OP_MANUAL"), Some(&json!("1")));
@@ -854,6 +868,7 @@ mod tests {
         );
         assert!(!env.contains_key("TURA_COMMAND_RUN_SANDBOX"));
 
+        restore_env("TURA_SESSION_MODEL_OVERRIDE", previous_model_override);
         restore_env("TURA_SESSION_MAX_TOKENS", previous_model);
         restore_env("TURA_GOAL_MODE", previous_goal);
         restore_env("TURA_NO_OP_MANUAL", previous_no_op);

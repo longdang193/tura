@@ -189,6 +189,49 @@ async fn create_runtime_business_flow_ignores_unresolvable_model_override_and_us
 }
 
 #[tokio::test]
+async fn runtime_model_override_uses_profile_route_when_agent_route_is_unregistered() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set(&[
+        ("TURA_SESSION_MODEL_OVERRIDE", "openai/combo-high"),
+        ("TURA_PROVIDER_TOTAL_TIMEOUT_MS", "0"),
+    ]);
+    let settings = settings_with_routes(
+        vec![(
+            "fast",
+            RouteConfig {
+                default_temperature: 0.2,
+                providers: vec![LlmProviderConfig {
+                    provider: "openai".to_string(),
+                    base_url: "http://127.0.0.1:17667/v1".to_string(),
+                    model: "combo-high".to_string(),
+                    temperature: 0.2,
+                }],
+            },
+        )],
+        HashMap::from([(
+            "openai".to_string(),
+            "http://127.0.0.1:17667/v1".to_string(),
+        )]),
+    );
+
+    let provider = runtime_provider_config_from_tura(
+        &provider_config_with_current_model(
+            "codex/gpt-5.6-sol",
+            None,
+            Some("codex/gpt-5.6-sol"),
+        ),
+        &settings,
+        false,
+    )
+    .unwrap_or_else(|error| panic!("profile override should bypass stale agent route: {error}"));
+
+    assert_eq!(provider.llm_provider_name, "openai");
+    assert_eq!(provider.model_name, "combo-high");
+    assert_eq!(provider.provider_url_name, "http://127.0.0.1:17667/v1");
+    assert_eq!(provider.provider_name, "fast");
+}
+
+#[tokio::test]
 async fn runtime_latency_uses_selected_model_tier_not_agent_default_tier() {
     let _guard = ENV_LOCK.lock().await;
     let _env = EnvGuard::clear(&[
